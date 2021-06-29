@@ -2,88 +2,99 @@
 package grpc_pool
 
 import (
+	"errors"
+	"fmt"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
+
+var ErrConnShutdown = errors.New("grpc conn shutdown")
 
 // Pool represents a gRPC connection pool.
 type Pool struct {
-	size int
-	ttl  int64
+	size int64
+	next int64
+
 	sync.Mutex
-	conns map[string][]*Conn
+	conns    []*grpc.ClientConn
+	dialFunc DialFunc
 }
 
-// Conn wrapped a gRPC connection with create time.
-type Conn struct {
-	*grpc.ClientConn
-	createdAt int64
-}
+type DialFunc func() (*grpc.ClientConn, error)
 
 // NewPool create a gRPC pool.
-func NewPool(size int, ttl time.Duration) *Pool {
-	return &Pool{
-		size:  size,
-		ttl:   int64(ttl.Seconds()),
-		conns: make(map[string][]*Conn),
+func NewPool(size int, dialFunc DialFunc) (*Pool, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("invalid pool size")
 	}
+
+	p := &Pool{
+		size:     int64(size),
+		conns:    make([]*grpc.ClientConn, size),
+		dialFunc: dialFunc,
+	}
+
+	for i := range p.conns {
+		conn, err := p.dialFunc()
+		if err != nil {
+			return nil, err
+		}
+		p.conns[i] = conn
+	}
+
+	return p, nil
+}
+
+func (p *Pool) checkState(conn *grpc.ClientConn) error {
+	state := conn.GetState()
+	switch state {
+	case connectivity.TransientFailure, connectivity.Shutdown:
+		return ErrConnShutdown
+	}
+
+	return nil
 }
 
 // GetConn return an available gRPC connection.
-func (p *Pool) GetConn(addr string, opts ...grpc.DialOption) (*Conn, error) {
-	p.Lock()
-	conns := p.conns[addr]
-	now := time.Now().Unix()
+func (p *Pool) GetConn() (*grpc.ClientConn, error) {
+	var (
+		idx  int64
+		next int64
 
-	for len(conns) > 0 {
-		conn := conns[len(conns)-1]
-		conns = conns[:len(conns)-1]
-		p.conns[addr] = conns
+		err error
+	)
 
-		// if conn is tool old then close it and move on
-		if d := now - conn.createdAt; d > p.ttl {
-			conn.Close()
-			continue
-		}
-
-		// we got a available one
-		p.Unlock()
+	next = atomic.AddInt64(&p.next, 1)
+	idx = next % p.size
+	conn := p.conns[idx]
+	if conn != nil && p.checkState(conn) == nil {
 		return conn, nil
 	}
 
-	p.Unlock()
+	// gc old conn
+	if conn != nil {
+		conn.Close()
+	}
 
-	// create new conn
-	c, err := grpc.Dial(addr, opts...)
+	p.Lock()
+	defer p.Unlock()
+
+	// double check, already inited
+	conn = p.conns[idx]
+	if conn != nil && p.checkState(conn) == nil {
+		return conn, nil
+	}
+
+	conn, err = p.dialFunc()
 	if err != nil {
 		return nil, err
 	}
 
-	return &Conn{
-		ClientConn: c,
-		createdAt:  time.Now().Unix(),
-	}, nil
-}
-
-// Release a gRPC connection to pool.
-func (p *Pool) Release(addr string, conn *Conn, err error) {
-	if err != nil {
-		conn.Close()
-		return
-	}
-
-	p.Lock()
-	conns := p.conns[addr]
-	if len(conns) >= p.size {
-		p.Unlock()
-		conn.Close()
-		return
-	}
-
-	p.conns[addr] = append(conns, conn)
-	p.Unlock()
+	p.conns[idx] = conn
+	return conn, nil
 }
 
 // Close the pool.
@@ -91,8 +102,8 @@ func (p *Pool) Close() {
 	p.Lock()
 	defer p.Unlock()
 
-	for _, conns := range p.conns {
-		for _, conn := range conns {
+	for _, conn := range p.conns {
+		if conn != nil {
 			conn.Close()
 		}
 	}
