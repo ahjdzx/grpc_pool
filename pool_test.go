@@ -83,7 +83,6 @@ func BenchmarkWithoutPool(b *testing.B) {
 	defer server.Stop()
 
 	addr := l.Addr().String()
-
 	dialFunc := func() (*grpc.ClientConn, error) {
 		return grpc.Dial(addr, grpc.WithInsecure())
 	}
@@ -123,7 +122,6 @@ func BenchmarkWithPool(b *testing.B) {
 	defer server.Stop()
 
 	addr := l.Addr().String()
-
 	dialFunc := func() (*grpc.ClientConn, error) {
 		return grpc.Dial(addr, grpc.WithInsecure())
 	}
@@ -152,4 +150,87 @@ func BenchmarkWithPool(b *testing.B) {
 	if resp.Message != "Hello Xin" {
 		b.Fatalf("Expect Hello Xin, but got %v", resp.Message)
 	}
+}
+
+func BenchmarkWithoutPoolParallel(b *testing.B) {
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		b.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	server := grpc.NewServer()
+	pb.RegisterGreeterServer(server, &greeterServer{})
+
+	go server.Serve(l)
+	defer server.Stop()
+
+	addr := l.Addr().String()
+	dialFunc := func() (*grpc.ClientConn, error) {
+		return grpc.Dial(addr, grpc.WithInsecure())
+	}
+
+	c, err := dialFunc()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(ppb *testing.PB) {
+		for ppb.Next() {
+			resp := pb.HelloReply{}
+			err = c.Invoke(context.TODO(), "/helloworld.Greeter/SayHello", &pb.HelloRequest{Name: "Xin"}, &resp)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if resp.Message != "Hello Xin" {
+				b.Fatalf("Expect Hello Xin, but got %v", resp.Message)
+			}
+		}
+	})
+}
+
+func BenchmarkWithPoolParallel(b *testing.B) {
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		b.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	server := grpc.NewServer()
+	pb.RegisterGreeterServer(server, &greeterServer{})
+
+	go server.Serve(l)
+	defer server.Stop()
+
+	addr := l.Addr().String()
+	dialFunc := func() (*grpc.ClientConn, error) {
+		return grpc.Dial(addr, grpc.WithInsecure())
+	}
+
+	pool, err := NewPool(10, dialFunc)
+	if err != nil {
+		return
+	}
+	defer pool.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(ppb *testing.PB) {
+		for ppb.Next() {
+			c, err := pool.GetConn()
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			resp := pb.HelloReply{}
+			err = c.Invoke(context.TODO(), "/helloworld.Greeter/SayHello", &pb.HelloRequest{Name: "Xin"}, &resp)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if resp.Message != "Hello Xin" {
+				b.Fatalf("Expect Hello Xin, but got %v", resp.Message)
+			}
+		}
+	})
 }
